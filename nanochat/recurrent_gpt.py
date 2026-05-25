@@ -30,12 +30,20 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
-from nanochat.fp8_static import LinearFP8
+
+# Use LinearFP8 only on Hopper+ GPUs, fall back to nn.Linear otherwise
+_fp8_available = False
+try:
+    import torch as _t
+    if _t.cuda.is_available() and _t.cuda.get_device_capability()[0] >= 9:
+        from nanochat.fp8_static import LinearFP8
+        _fp8_available = True
+except Exception:
+    pass
 
 
 @dataclass
@@ -90,9 +98,10 @@ class RecurrentCausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
-    def forward(self, x_normed, cos_sin, block_mask, score_mod, kv_src_normed=None):
-        """Parallel-pass attention via flex_attention.
+    def forward(self, x_normed, cos_sin, attn_mask, score_mod_unused, kv_src_normed=None):
+        """Parallel-pass attention via SDPA with precomputed mask.
 
+        attn_mask: (1, 1, T_ext, T_ext) additive bias mask (float, -inf for blocked)
         kv_src_normed: if provided, K/V are projected from this instead of
         x_normed. Used by second-half layers when split_cross_attn=True.
         """
@@ -108,17 +117,21 @@ class RecurrentCausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        # flex_attention layout: (B, heads, seq, head_dim)
+        # SDPA layout: (B, heads, seq, head_dim)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        y = flex_attention(
-            q, k, v,
-            score_mod=score_mod,
-            block_mask=block_mask,
-            enable_gqa=(self.n_kv_head < self.n_head),
-        )
+        # GQA: expand kv heads
+        if self.n_kv_head < self.n_head:
+            reps = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(reps, dim=1)
+            v = v.repeat_interleave(reps, dim=1)
+
+        if attn_mask is None:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
         y = y.transpose(1, 2).contiguous().view(B, T_ext, self.n_embd)
         return self.c_proj(y)
 
@@ -148,8 +161,11 @@ class RecurrentGPT(nn.Module):
             "wte": nn.Embedding(padded_vocab, config.n_embd),
             "h": nn.ModuleList([RecurrentBlock(config) for _ in range(config.n_layer)]),
         })
-        self.lm_head = LinearFP8(config.n_embd, padded_vocab, bias=False,
-                                  x_scale=100/448, w_scale=1.6/448, monitor=False)
+        if _fp8_available:
+            self.lm_head = LinearFP8(config.n_embd, padded_vocab, bias=False,
+                                      x_scale=100/448, w_scale=1.6/448, monitor=False)
+        else:
+            self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
 
@@ -230,54 +246,60 @@ class RecurrentGPT(nn.Module):
         return 6 * (nparams - nparams_excl) + attn_flops
 
     # ------------------------------------------------------------------
-    # Flex-attention helpers (parallel pass)
+    # Attention mask helpers (parallel pass) — uses SDPA with additive mask
     # ------------------------------------------------------------------
 
-    def _get_block_mask(self, T, device):
-        key = (T, str(device))
-        if key not in self._block_mask_cache:
-            self._block_mask_cache[key] = self._create_block_mask(T, device)
-        return self._block_mask_cache[key]
+    def _get_attn_mask(self, T, device):
+        """Build and cache additive attention mask for the parallel pass.
 
-    def _create_block_mask(self, T, device):
+        Returns: (1, n_head, T_ext, T_ext) float mask where -inf = blocked.
+        Incorporates: windowed causal masking, memory-cannot-see-own-real-token,
+        and ALiBi per-slot bias on memory keys.
+        """
         M = self.config.n_memory_tokens
         W = self.config.memory_window
         S = M + 1
+        n_head = self.config.n_head
+        key = (T, str(device))
+        if key not in self._block_mask_cache:
+            self._block_mask_cache[key] = self._build_attn_mask(T, M, W, S, n_head, device)
+        return self._block_mask_cache[key]
 
+    def _build_attn_mask(self, T, M, W, S, n_head, device):
         if M == 0:
-            # Standard causal sliding window
-            def mask_fn(b, h, q_idx, kv_idx):
-                return (q_idx >= kv_idx) & (q_idx - kv_idx <= W)
-            return create_block_mask(mask_fn, B=None, H=None,
-                                     Q_LEN=T, KV_LEN=T, device=device)
+            # Full causal attention (no window restriction when no memory)
+            return None  # signals to use is_causal=True in SDPA
 
-        def mask_fn(b, h, q_idx, kv_idx):
-            q_block = q_idx // S
-            q_local = q_idx % S
-            kv_block = kv_idx // S
-            kv_local = kv_idx % S
-            in_window = (q_block - kv_block >= 0) & (q_block - kv_block <= W)
-            # memory tokens at step t cannot attend to the real token at step t
-            not_blocked = ~((q_block == kv_block) & (q_local < M) & (kv_local == M))
-            return in_window & not_blocked
+        T_ext = T * S
+        idx = torch.arange(T_ext, device=device)
+        q_block = idx // S
+        q_local = idx % S
+        kv_block = idx // S
+        kv_local = idx % S
 
-        return create_block_mask(mask_fn, B=None, H=None,
-                                 Q_LEN=T * S, KV_LEN=T * S, device=device)
+        # Build boolean mask: (T_ext, T_ext)
+        q_b = q_block.unsqueeze(1)   # (T_ext, 1)
+        kv_b = kv_block.unsqueeze(0) # (1, T_ext)
+        q_l = q_local.unsqueeze(1)
+        kv_l = kv_local.unsqueeze(0)
 
-    def _make_score_mod(self):
-        """ALiBi per-slot bias: attending to memory key at slot j incurs -slope_h * j."""
-        M = self.config.n_memory_tokens
-        if M == 0:
-            return None
-        S = M + 1
-        slopes = self.alibi_slopes  # (n_head,) buffer, captured by reference
+        in_window = (q_b - kv_b >= 0) & (q_b - kv_b <= W)
+        not_blocked = ~((q_b == kv_b) & (q_l < M) & (kv_l == M))
+        allowed = in_window & not_blocked
 
-        def score_mod(score, b, h, q_idx, kv_idx):
-            kv_local = kv_idx % S
-            is_memory = kv_local < M
-            return score - slopes[h] * kv_local * is_memory
+        # Start with boolean mask → float mask
+        attn_mask = torch.where(allowed, 0.0, float('-inf'))  # (T_ext, T_ext)
 
-        return score_mod
+        # Add ALiBi bias for memory keys: (n_head, T_ext, T_ext)
+        is_mem_key = (kv_l < M).float()  # (1, T_ext)
+        slot_idx = kv_l.float() * is_mem_key  # (1, T_ext)
+        slopes = self.alibi_slopes.to(device)  # (n_head,)
+        alibi = -(slopes[:, None, None] * slot_idx[None, :, :])  # (n_head, 1, T_ext)
+        alibi = alibi.expand(n_head, T_ext, T_ext)  # (n_head, T_ext, T_ext)
+
+        # Combine: (n_head, T_ext, T_ext)
+        attn_mask = attn_mask.unsqueeze(0) + alibi  # broadcast (1, T_ext, T_ext) + (n_head, T_ext, T_ext)
+        return attn_mask.unsqueeze(0)  # (1, n_head, T_ext, T_ext)
 
     # ------------------------------------------------------------------
     # Sequential-pass attention helpers
@@ -403,6 +425,203 @@ class RecurrentGPT(nn.Module):
         return x, new_kv_bufs, first_half_out_new
 
     # ------------------------------------------------------------------
+    # Compiled sequential pass with static-shape KV buffers
+    # ------------------------------------------------------------------
+
+    def _init_seq_buffers(self, B, device):
+        """Preallocate static KV buffers for compiled sequential pass."""
+        M = self.config.n_memory_tokens
+        S = M + 1
+        W = self.config.memory_window
+        n_layer = self.config.n_layer
+        n_kv_head = self.config.n_kv_head
+        head_dim = self.config.n_embd // self.config.n_head
+        buf_len = (W + 1) * S  # W blocks history + 1 current block
+
+        kv_k = [torch.zeros(B, buf_len, n_kv_head, head_dim, dtype=torch.bfloat16, device=device)
+                 for _ in range(n_layer)]
+        kv_v = [torch.zeros(B, buf_len, n_kv_head, head_dim, dtype=torch.bfloat16, device=device)
+                 for _ in range(n_layer)]
+        return kv_k, kv_v
+
+    def _seq_attn_bias_static(self, buf_len, S, M):
+        """Static attention bias for the compiled sequential pass.
+        Shape: (1, n_head, S, buf_len)
+
+        All buf_len positions assumed valid (caller masks invalid with -inf).
+        Encodes: memory queries cannot see own real token + ALiBi.
+        """
+        n_head = self.config.n_head
+        device = self.get_device()
+        bias = torch.zeros(1, n_head, S, buf_len, device=device)
+
+        # Memory queries (0..M-1) cannot see the real token (last position = buf_len-1)
+        if M > 0:
+            bias[:, :, :M, -1] = float('-inf')
+
+        # ALiBi for memory keys: slot index within each block
+        k_local = torch.arange(buf_len, device=device) % S
+        is_mem = (k_local < M).float()
+        alibi_slot = k_local.float() * is_mem
+        slopes = self.alibi_slopes.to(device)
+        alibi_bias = -(slopes[None, :, None, None] * alibi_slot[None, None, None, :])
+        bias = bias + alibi_bias
+
+        return bias
+
+    def _seq_step_static(self, x, x0, cos_t, sin_t, kv_k, kv_v, seq_attn_bias):
+        """One block step through all layers with fixed-shape KV buffers.
+
+        x: (B, S, n_embd)
+        x0: (B, S, n_embd)
+        cos_t, sin_t: (1, S, 1, head_dim//2) — RoPE for position t expanded to S
+        kv_k: list of (B, buf_len, n_kv_head, head_dim) per layer
+        kv_v: same
+        seq_attn_bias: (1, n_head, S, buf_len) — precomputed, includes ALiBi + validity mask
+
+        Returns: x, kv_k, kv_v, first_half_out
+        """
+        B, S, _ = x.shape
+        M = self.config.n_memory_tokens
+        n_layer = self.config.n_layer
+        half = n_layer // 2
+        n_head = self.config.n_head
+        n_kv_head = self.config.n_kv_head
+        head_dim = self.config.n_embd // n_head
+        first_half_out = None
+
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            x_normed = norm(x)
+
+            if self.config.split_cross_attn and i >= half:
+                kv_src_normed = norm(first_half_out)
+            else:
+                kv_src_normed = x_normed
+
+            attn = block.attn
+
+            # Project Q, K, V
+            q = attn.c_q(x_normed).view(B, S, n_head, head_dim)
+            k = attn.c_k(kv_src_normed).view(B, S, n_kv_head, head_dim)
+            v = attn.c_v(kv_src_normed).view(B, S, n_kv_head, head_dim)
+
+            # RoPE + QK-norm
+            q = norm(apply_rotary_emb(q, cos_t, sin_t))
+            k = norm(apply_rotary_emb(k, cos_t, sin_t))
+
+            # Shift buffer left by S and write new K,V at the end
+            kv_k[i] = torch.cat([kv_k[i][:, S:, :, :], k], dim=1)
+            kv_v[i] = torch.cat([kv_v[i][:, S:, :, :], v], dim=1)
+
+            # GQA expand
+            if n_kv_head < n_head:
+                reps = n_head // n_kv_head
+                k_exp = kv_k[i].repeat_interleave(reps, dim=2)
+                v_exp = kv_v[i].repeat_interleave(reps, dim=2)
+            else:
+                k_exp, v_exp = kv_k[i], kv_v[i]
+
+            # SDPA: Q=(B, n_head, S, hd), K=(B, n_head, buf_len, hd)
+            attn_out = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k_exp.transpose(1, 2),
+                v_exp.transpose(1, 2),
+                attn_mask=seq_attn_bias,
+                is_causal=False,
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.config.n_embd)
+            x = x + attn.c_proj(attn_out)
+            x = x + block.mlp(norm(x))
+
+            if i == half - 1 and self.config.split_cross_attn:
+                first_half_out = x
+
+        return x, kv_k, kv_v, first_half_out
+
+    @torch.no_grad()
+    def forward_sequential_compiled(self, idx, carry_state=None):
+        """Compiled-friendly sequential pass with static-shape KV buffers.
+
+        Uses fixed-size buffers of shape (B, (W+1)*S, n_kv_head, head_dim) per layer.
+        At each step, shift buffer left by S and write new K,V at the end.
+        Invalid positions (during warmup) are masked with -inf in the attention bias.
+
+        Args:
+            idx: (B, T) token indices
+            carry_state: optional dict with 'mem_state', 'kv_k', 'kv_v', 'step'
+                         from a previous call to enable cross-batch memory carry-over.
+
+        Returns: (memory_states, carry_state_out)
+            memory_states: (B, T, M, n_embd) or None when M == 0
+            carry_state_out: dict for passing to next call
+        """
+        B, T = idx.size()
+        M = self.config.n_memory_tokens
+        S = M + 1
+        W = self.config.memory_window
+        device = idx.device
+
+        if M == 0:
+            return None, None
+
+        buf_len = (W + 1) * S
+
+        if carry_state is not None:
+            mem_state = carry_state['mem_state']
+            kv_k = carry_state['kv_k']
+            kv_v = carry_state['kv_v']
+            t_offset = carry_state['step']
+        else:
+            kv_k, kv_v = self._init_seq_buffers(B, device)
+            mem_state = torch.zeros(B, M, self.config.n_embd, dtype=torch.bfloat16, device=device)
+            t_offset = 0
+
+        memory_states = torch.zeros(B, T, M, self.config.n_embd, dtype=torch.bfloat16, device=device)
+
+        # Precompute the "steady state" attention bias (for t >= W, all buf positions valid)
+        steady_bias = self._seq_attn_bias_static(buf_len, S, M)
+
+        # For warmup steps (global t < W), mask invalid buffer positions
+        warmup_biases = []
+        for t_global in range(t_offset, min(t_offset + T, W)):
+            valid_start = buf_len - (t_global + 1) * S
+            bias = steady_bias.clone()
+            if valid_start > 0:
+                bias[:, :, :, :valid_start] = float('-inf')
+            warmup_biases.append(bias)
+
+        rope_len = self.cos.size(1)
+
+        for t in range(T):
+            memory_states[:, t] = mem_state
+
+            tok_emb = norm(self.transformer.wte(idx[:, t:t+1]))
+            x = torch.cat([norm(mem_state), tok_emb], dim=1)  # (B, S, n_embd)
+            x0 = x
+
+            t_global = t_offset + t
+            rope_pos = t_global % rope_len
+            cos_t = self.cos[:, rope_pos:rope_pos+1].expand(-1, S, -1, -1)
+            sin_t = self.sin[:, rope_pos:rope_pos+1].expand(-1, S, -1, -1)
+
+            if t_global < W:
+                bias = warmup_biases[t_global - t_offset]
+            else:
+                bias = steady_bias
+
+            x, kv_k, kv_v, _ = self._seq_step_static(x, x0, cos_t, sin_t, kv_k, kv_v, bias)
+            mem_state = x[:, :M, :]
+
+        carry_state_out = {
+            'mem_state': mem_state,
+            'kv_k': kv_k,
+            'kv_v': kv_v,
+            'step': t_offset + T,
+        }
+        return memory_states, carry_state_out
+
+    # ------------------------------------------------------------------
     # Two-pass training forward
     # ------------------------------------------------------------------
 
@@ -494,8 +713,8 @@ class RecurrentGPT(nn.Module):
             sin_ext = self.sin[:, :T]
         cos_sin = (cos_ext, sin_ext)
 
-        block_mask = self._get_block_mask(T, device)
-        score_mod = self._make_score_mod()
+        attn_mask = self._get_attn_mask(T, device)
+        score_mod = None  # unused, kept for interface compat
 
         first_half_snapshot = None
         for i, block in enumerate(self.transformer.h):
@@ -504,7 +723,7 @@ class RecurrentGPT(nn.Module):
                 kv_src = first_half_snapshot
             else:
                 kv_src = None
-            x = block(x, cos_sin, block_mask, score_mod, kv_src=kv_src)
+            x = block(x, cos_sin, attn_mask, score_mod, kv_src=kv_src)
             if i == half - 1 and self.config.split_cross_attn:
                 first_half_snapshot = x
 
@@ -533,8 +752,22 @@ class RecurrentGPT(nn.Module):
         """Two-pass training: sequential (no_grad) then parallel (with grad)."""
         memory_states = None
         if self.config.n_memory_tokens > 0:
-            memory_states = self.forward_sequential(idx).detach()
+            memory_states, _ = self.forward_sequential_compiled(idx)
+            memory_states = memory_states.detach()
         return self.forward_parallel(idx, memory_states, targets, loss_reduction)
+
+    def forward_with_carry(self, idx, targets=None, loss_reduction='mean', carry_state=None):
+        """Like forward() but carries memory state across calls.
+
+        Returns: (loss_or_logits, carry_state_out)
+        """
+        memory_states = None
+        carry_state_out = None
+        if self.config.n_memory_tokens > 0:
+            memory_states, carry_state_out = self.forward_sequential_compiled(idx, carry_state)
+            memory_states = memory_states.detach()
+        loss_or_logits = self.forward_parallel(idx, memory_states, targets, loss_reduction)
+        return loss_or_logits, carry_state_out
 
     # ------------------------------------------------------------------
     # Optimizers

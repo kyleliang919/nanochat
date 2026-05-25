@@ -9,7 +9,6 @@ import logging
 import torch
 
 from nanochat.common import get_base_dir
-from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -79,6 +78,7 @@ def build_model(checkpoint_dir, step, device, phase):
     - tokenizer
     - meta data saved during base model training
     """
+    from nanochat.gpt import GPT, GPTConfig
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
     if device.type in {"cpu", "mps"}:

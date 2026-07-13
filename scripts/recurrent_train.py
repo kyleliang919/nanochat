@@ -55,6 +55,17 @@ parser.add_argument("--chunk_size", type=int, default=128,
 # Split cross-attention
 parser.add_argument("--split_cross_attn", action="store_true", default=False,
                     help="second half of layers cross-attend to first half output")
+# Parallel K-pass unroll
+parser.add_argument("--parallel_unroll", action="store_true", default=False,
+                    help="use K parallel encoder passes + non-recurrent decoder instead of sequential two-pass")
+parser.add_argument("--n_memory_passes", type=int, default=2,
+                    help="K: number of parallel encoder passes (hops of recurrence)")
+parser.add_argument("--no_detach_memory", dest="detach_memory", action="store_false", default=True,
+                    help="backprop through all K passes (default: detach memory carry between passes)")
+parser.add_argument("--encoder_window", type=int, default=0,
+                    help="first-half memory attention window in real-token blocks (0 = full attention)")
+parser.add_argument("--decoder_window", type=int, default=0,
+                    help="second-half decoder attention window in tokens (0 = full attention)")
 # Training horizon
 parser.add_argument("--num_iterations", type=int, default=-1)
 parser.add_argument("--target_flops", type=float, default=-1.0)
@@ -116,6 +127,9 @@ num_heads = find_num_heads(model_dim, args.head_dim)
 num_kv_heads = num_heads
 print0(f"num_layers: {num_layers}, model_dim: {model_dim}, num_heads: {num_heads}")
 print0(f"n_memory_tokens: {args.n_memory_tokens}, memory_window: {args.memory_window}, split_cross_attn: {args.split_cross_attn}")
+if args.parallel_unroll:
+    print0(f"parallel_unroll: K={args.n_memory_passes}, detach_memory={args.detach_memory}, "
+           f"encoder_window={args.encoder_window}, decoder_window={args.decoder_window}")
 
 if args.n_memory_tokens > 0:
     assert args.max_seq_len % args.chunk_size == 0, \
@@ -155,6 +169,11 @@ model_config_kwargs = dict(
     n_memory_tokens=args.n_memory_tokens,
     memory_window=args.memory_window,
     split_cross_attn=args.split_cross_attn,
+    parallel_unroll=args.parallel_unroll,
+    n_memory_passes=args.n_memory_passes,
+    detach_memory=args.detach_memory,
+    encoder_window=args.encoder_window,
+    decoder_window=args.decoder_window,
 )
 with torch.device("meta"):
     model_config = RecurrentGPTConfig(**model_config_kwargs)

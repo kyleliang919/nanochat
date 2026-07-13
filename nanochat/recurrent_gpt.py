@@ -26,6 +26,7 @@ Both features default to off and are fully independent.
 
 from functools import partial
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -59,6 +60,20 @@ class RecurrentGPTConfig:
     memory_window: int = 8     # W: sliding window size in real-token units
     # Split cross-attention
     split_cross_attn: bool = False  # second half cross-attends to first half output
+
+    # ----- Parallel K-pass unroll (alternative to the sequential two-pass) -----
+    # When True, the first half acts as a recurrent memory *encoder* trained by
+    # K parallel forward passes (each re-seeding the memory slots with the prior
+    # pass's memory output), approximating K hops of the recurrence. The second
+    # half is a plain non-recurrent decoder over the real-token positions.
+    parallel_unroll: bool = False
+    n_memory_passes: int = 2        # K: number of parallel encoder passes (>=1)
+    detach_memory: bool = True      # detach memory carry between passes (True) or
+                                    # backprop through all K passes (False)
+    encoder_window: int = 0         # first-half memory attention window in real-token
+                                    # blocks; 0 = full attention
+    decoder_window: int = 0         # second-half decoder attention window in tokens;
+                                    # 0 = full attention
 
 
 def norm(x):
@@ -181,6 +196,23 @@ class RecurrentGPT(nn.Module):
         self.register_buffer("alibi_slopes", alibi, persistent=False)
 
         self._block_mask_cache: dict = {}
+        self._enc_mask_cache: dict = {}   # interleaved encoder masks (parallel_unroll)
+        self._dec_mask_cache: dict = {}   # plain causal decoder masks (parallel_unroll)
+
+        # Learned initial memory seed for the parallel K-pass unroll. It only
+        # receives a gradient when it lies on the loss path, i.e. K==1 or when
+        # gradients are backpropagated through all passes (detach_memory=False).
+        # In the detach_memory=True & K>=2 regime the seed only feeds detached
+        # early passes and can never train, so we make it a fixed zero buffer.
+        self.has_mem_seed = config.parallel_unroll and config.n_memory_tokens > 0
+        if self.has_mem_seed:
+            seed_learnable = (config.n_memory_passes <= 1) or (not config.detach_memory)
+            seed = torch.zeros(config.n_memory_tokens, config.n_embd)
+            if seed_learnable:
+                self.mem_seed = nn.Parameter(seed)
+            else:
+                self.register_buffer("mem_seed", seed, persistent=True)
+            self.mem_seed_learnable = seed_learnable
 
     # ------------------------------------------------------------------
     # Initialisation helpers
@@ -217,6 +249,8 @@ class RecurrentGPT(nn.Module):
         with torch.no_grad():
             self.resid_lambdas.fill_(1.0)
             self.x0_lambdas.fill_(0.0)
+            if self.has_mem_seed:
+                self.mem_seed.zero_()
         head_dim = self.config.n_embd // self.config.n_head
         self.cos, self.sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.alibi_slopes = self._compute_alibi_slopes(self.config.n_head).to(
@@ -242,6 +276,17 @@ class RecurrentGPT(nn.Module):
         h = self.config.n_head
         d = self.config.n_embd // h
         eff_attn = min(W * S, T_ext)
+        if self.config.parallel_unroll:
+            # First half runs K times over the interleaved sequence; second half
+            # runs once over T real tokens. Approximate the per-token matmul cost
+            # by weighting the two halves accordingly.
+            K = max(1, self.config.n_memory_passes)
+            half = self.config.n_layer // 2
+            matmul = 6 * (nparams - nparams_excl)
+            enc_frac = (half / self.config.n_layer) if self.config.n_layer else 0.5
+            dec_frac = 1.0 - enc_frac
+            matmul = matmul * (K * S * enc_frac + dec_frac)
+            return matmul
         attn_flops = self.config.n_layer * 12 * h * d * eff_attn
         return 6 * (nparams - nparams_excl) + attn_flops
 
@@ -300,6 +345,171 @@ class RecurrentGPT(nn.Module):
         # Combine: (n_head, T_ext, T_ext)
         attn_mask = attn_mask.unsqueeze(0) + alibi  # broadcast (1, T_ext, T_ext) + (n_head, T_ext, T_ext)
         return attn_mask.unsqueeze(0)  # (1, n_head, T_ext, T_ext)
+
+    # ------------------------------------------------------------------
+    # Parallel K-pass unroll: encoder / decoder masks
+    # ------------------------------------------------------------------
+
+    def _get_encoder_mask(self, T, device):
+        """Additive attention mask for the interleaved first-half encoder.
+
+        Same interleaving as the sequential path ([mem_0..mem_{M-1}, token] per
+        step), but the window comes from encoder_window (0 = full attention).
+        ALiBi per-slot bias on memory keys is baked into the mask (no score_mod).
+        Returns (1, n_head, T_ext, T_ext) float, matching the SDPA convention.
+        """
+        M = self.config.n_memory_tokens
+        S = M + 1
+        W = self.config.encoder_window
+        n_head = self.config.n_head
+        key = (T, str(device))
+        if key not in self._enc_mask_cache:
+            T_ext = T * S
+            idx = torch.arange(T_ext, device=device)
+            q_b = (idx // S).unsqueeze(1)   # (T_ext, 1)
+            kv_b = (idx // S).unsqueeze(0)  # (1, T_ext)
+            q_l = (idx % S).unsqueeze(1)
+            kv_l = (idx % S).unsqueeze(0)
+
+            causal = (q_b - kv_b) >= 0
+            in_window = causal if W <= 0 else (causal & ((q_b - kv_b) <= W))
+            not_blocked = ~((q_b == kv_b) & (q_l < M) & (kv_l == M))
+            allowed = in_window & not_blocked
+
+            attn_mask = torch.where(allowed, 0.0, float('-inf'))  # (T_ext, T_ext)
+
+            # ALiBi on memory keys: -slope_h * slot_idx
+            is_mem_key = (kv_l < M).float()          # (1, T_ext)
+            slot_idx = kv_l.float() * is_mem_key     # (1, T_ext)
+            slopes = self.alibi_slopes.to(device)    # (n_head,)
+            alibi = -(slopes[:, None, None] * slot_idx[None, :, :])  # (n_head, 1, T_ext)
+            alibi = alibi.expand(n_head, T_ext, T_ext)
+            attn_mask = attn_mask.unsqueeze(0) + alibi              # (n_head, T_ext, T_ext)
+            self._enc_mask_cache[key] = attn_mask.unsqueeze(0)     # (1, n_head, T_ext, T_ext)
+        return self._enc_mask_cache[key]
+
+    def _get_decoder_mask(self, T, device):
+        """Plain causal (optionally sliding-window) mask over T real tokens.
+
+        Returns None for full causal (SDPA uses is_causal=True), else a
+        (1, 1, T, T) additive float mask for the windowed case.
+        """
+        W = self.config.decoder_window
+        if W <= 0:
+            return None
+        key = (T, str(device))
+        if key not in self._dec_mask_cache:
+            idx = torch.arange(T, device=device)
+            q = idx.unsqueeze(1)   # (T, 1)
+            kv = idx.unsqueeze(0)  # (1, T)
+            allowed = (q >= kv) & ((q - kv) <= W)
+            attn_mask = torch.where(allowed, 0.0, float('-inf'))  # (T, T)
+            self._dec_mask_cache[key] = attn_mask[None, None]     # (1, 1, T, T)
+        return self._dec_mask_cache[key]
+
+    # ------------------------------------------------------------------
+    # Parallel K-pass unroll: forward
+    # ------------------------------------------------------------------
+
+    def _encoder_pass(self, token_embeds, mem_normed, cos_sin, block_mask, score_mod):
+        """Run the first half over the interleaved [mem, token] sequence.
+
+        Returns (h1_real, mem_out):
+          h1_real: (B, T, n_embd) first-half output at real-token positions
+          mem_out: (B, T, M, n_embd) first-half output at memory positions
+        """
+        B, T, _ = token_embeds.shape
+        M = self.config.n_memory_tokens
+        S = M + 1
+        half = self.config.n_layer // 2
+
+        combined = torch.cat([mem_normed, token_embeds.unsqueeze(2)], dim=2)  # (B,T,S,C)
+        x = combined.reshape(B, T * S, self.config.n_embd)
+        x0 = x
+        for i in range(half):
+            block = self.transformer.h[i]
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            x = block(x, cos_sin, block_mask, score_mod, kv_src=None)
+
+        x = x.view(B, T, S, self.config.n_embd)
+        mem_out = x[:, :, :M, :]           # (B, T, M, n_embd)
+        h1_real = x[:, :, M, :]            # (B, T, n_embd)
+        return h1_real, mem_out
+
+    def forward_parallel_unroll(self, idx, targets=None, loss_reduction='mean'):
+        """Parallel K-pass unrolled recurrence (first half) + non-recurrent decoder.
+
+        The first half is run K = n_memory_passes times. Pass 0 seeds the memory
+        slots with the learned mem_seed; each subsequent pass re-seeds them with
+        the previous pass's memory output (detached iff detach_memory). The final
+        pass's real-token outputs feed the second-half decoder.
+        """
+        B, T = idx.size()
+        M = self.config.n_memory_tokens
+        S = M + 1
+        n_layer = self.config.n_layer
+        half = n_layer // 2
+        device = idx.device
+        K = max(1, self.config.n_memory_passes)
+
+        token_embeds = norm(self.transformer.wte(idx))  # (B, T, n_embd)
+
+        # ----- First half: recurrent memory encoder (or plain half when M==0) -----
+        if M > 0:
+            assert T <= self.cos.size(1), f"T={T} exceeds rotary cache {self.cos.size(1)}"
+            block_pos = torch.arange(T, device=device).repeat_interleave(S)
+            enc_cos_sin = (self.cos[:, block_pos], self.sin[:, block_pos])
+            enc_mask = self._get_encoder_mask(T, device)
+            score_mod = None  # ALiBi baked into enc_mask under the SDPA convention
+
+            # Seed memory: (B, T, M, n_embd) broadcast from (M, n_embd)
+            mem_state = self.mem_seed.to(token_embeds.dtype)[None, None].expand(B, T, M, -1)
+            for k in range(K):
+                mem_normed = norm(mem_state)
+                # Detach early passes when requested; the last pass always keeps grad.
+                use_no_grad = self.config.detach_memory and (k < K - 1)
+                ctx = torch.no_grad() if use_no_grad else nullcontext()
+                with ctx:
+                    h1_real, mem_out = self._encoder_pass(
+                        token_embeds, mem_normed, enc_cos_sin, enc_mask, score_mod)
+                mem_state = mem_out
+                if self.config.detach_memory and k < K - 1:
+                    mem_state = mem_state.detach()
+        else:
+            # No memory: first half is a plain causal/sliding transformer over T tokens.
+            enc_cos_sin = (self.cos[:, :T], self.sin[:, :T])
+            dec_mask = self._get_decoder_mask(T, device)
+            x = token_embeds
+            x0 = x
+            for i in range(half):
+                block = self.transformer.h[i]
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                x = block(x, enc_cos_sin, dec_mask, None, kv_src=None)
+            h1_real = x
+
+        # ----- Second half: non-recurrent decoder over real-token positions -----
+        dec_cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        dec_mask = self._get_decoder_mask(T, device)
+        x = h1_real
+        x0 = x
+        for i in range(half, n_layer):
+            block = self.transformer.h[i]
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            x = block(x, dec_cos_sin, dec_mask, None, kv_src=None)
+
+        softcap = 15
+        logits = self.lm_head(norm(x))
+        logits = logits[..., :self.config.vocab_size].float()
+        logits = softcap * torch.tanh(logits / softcap)
+
+        if targets is not None:
+            return F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction=loss_reduction,
+            )
+        return logits
 
     # ------------------------------------------------------------------
     # Sequential-pass attention helpers
@@ -749,7 +959,14 @@ class RecurrentGPT(nn.Module):
         return logits
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
-        """Two-pass training: sequential (no_grad) then parallel (with grad)."""
+        """Dispatch to the configured training forward.
+
+        parallel_unroll: K parallel encoder passes (approximating K hops of the
+          recurrence) + non-recurrent decoder. Single differentiable path.
+        otherwise: original two-pass (sequential no_grad + parallel with grad).
+        """
+        if self.config.parallel_unroll:
+            return self.forward_parallel_unroll(idx, targets, loss_reduction)
         memory_states = None
         if self.config.n_memory_tokens > 0:
             memory_states, _ = self.forward_sequential_compiled(idx)
@@ -783,9 +1000,12 @@ class RecurrentGPT(nn.Module):
         lm_head_params  = list(self.lm_head.parameters())
         resid_params    = [self.resid_lambdas]
         x0_params       = [self.x0_lambdas]
+        # Learned memory seed (parallel_unroll only, and only when it's on the
+        # loss path). Treat it like an embedding-style vector for AdamW.
+        seed_params = [self.mem_seed] if (self.has_mem_seed and self.mem_seed_learnable) else []
         assert (len(list(self.parameters())) ==
                 len(matrix_params) + len(embedding_params) + len(lm_head_params) +
-                len(resid_params) + len(x0_params))
+                len(resid_params) + len(x0_params) + len(seed_params))
 
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling LR ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -795,6 +1015,8 @@ class RecurrentGPT(nn.Module):
             dict(params=resid_params,    lr=scalar_lr * 0.01),
             dict(params=x0_params,       lr=scalar_lr),
         ]
+        if seed_params:
+            adam_groups.append(dict(params=seed_params, lr=embedding_lr * dmodel_lr_scale))
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw = AdamWFactory(adam_groups, betas=adam_betas, eps=1e-10, weight_decay=0.0)
 
@@ -812,8 +1034,64 @@ class RecurrentGPT(nn.Module):
     # Inference
     # ------------------------------------------------------------------
 
-    @torch.inference_mode()
+    @torch.no_grad()
+    def generate_parallel_unroll(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+        """Streaming autoregressive generation for parallel_unroll models.
+
+        The parallel_unroll model computes a K-hop approximation of the
+        recurrence (see forward_parallel_unroll), which is a *global* function
+        of the sequence: memory at each step is refined over K passes across the
+        whole (windowed) context, and the decoder is causal over first-half
+        outputs. There is no exact single-token incremental state, so to stay
+        consistent with training semantics we recompute the forward over the
+        growing prefix and read the last position's logits.
+
+        This is O(T^2) over the generated length; fine for eval/sampling of
+        short continuations. For long-form high-throughput decoding, a
+        windowed incremental cache would be needed (not implemented).
+        """
+        assert isinstance(tokens, list) and len(tokens) > 0
+        device = self.get_device()
+
+        rng = None
+        if temperature > 0:
+            rng = torch.Generator(device=device)
+            rng.manual_seed(seed)
+
+        seq = list(tokens)
+        softcap = 15
+        for _ in range(max_tokens):
+            idx = torch.tensor([seq], dtype=torch.long, device=device)  # (1, T)
+            logits = self.forward_parallel_unroll(idx)  # (1, T, vocab)
+            logits = logits[:, -1, :]  # (1, vocab) — already softcapped + fp32
+            if top_k is not None:
+                v_topk, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v_topk[:, [-1]]] = float('-inf')
+            if temperature > 0:
+                next_tok = torch.multinomial(
+                    F.softmax(logits / temperature, dim=-1),
+                    num_samples=1, generator=rng).item()
+            else:
+                next_tok = torch.argmax(logits, dim=-1).item()
+            yield next_tok
+            seq.append(next_tok)
+
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+        """Streaming autoregressive generation.
+
+        For parallel_unroll models, delegates to generate_parallel_unroll (which
+        recomputes the K-pass forward over the growing prefix under no_grad). The
+        original sequential path below runs under inference_mode.
+        """
+        if self.config.parallel_unroll:
+            yield from self.generate_parallel_unroll(
+                tokens, max_tokens, temperature=temperature, top_k=top_k, seed=seed)
+            return
+        yield from self._generate_sequential(
+            tokens, max_tokens, temperature=temperature, top_k=top_k, seed=seed)
+
+    @torch.inference_mode()
+    def _generate_sequential(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
         """Streaming autoregressive generation via sequential block-by-block forward."""
         assert isinstance(tokens, list) and len(tokens) > 0
         device = self.get_device()
